@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import sys
 import warnings
 from contextvars import ContextVar
 from pathlib import Path  # noqa: TC003  used at runtime by ``setup_scan_logging``
@@ -63,18 +64,56 @@ _HANDLER_TAG = "_strix_scan_handler"
 # ``openai.agents`` is the openai-agents SDK's canonical logger root.
 _TRACKED_ROOTS: tuple[str, ...] = ("strix", "openai.agents")
 
+_STDOUT_QUIET_ROOTS: frozenset[str] = frozenset({"openai.agents"})
+
+
+class _StdoutQuietFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        return not any(
+            record.name == root or record.name.startswith(root + ".")
+            for root in _STDOUT_QUIET_ROOTS
+        )
+
 
 def configure_dependency_logging() -> None:
     """Quiet dependency logging/warnings that obscure Strix scan logs."""
-    with contextlib.suppress(Exception):
-        import litellm
-
-        litellm_logging = litellm._logging
-        litellm_logging._disable_debugging()  # type: ignore[no-untyped-call]
+    litellm = sys.modules.get("litellm")
+    if litellm is not None:
+        with contextlib.suppress(Exception):
+            litellm._logging._disable_debugging()
 
     logging.getLogger("asyncio").setLevel(logging.CRITICAL)
     logging.getLogger("asyncio").propagate = False
     warnings.filterwarnings("ignore", category=RuntimeWarning, module="asyncio")
+    _silence_urllib3_finalizer_noise()
+
+
+_unraisable_hook_installed = False
+
+
+def _is_urllib3_closed_file_noise(unraisable: sys.UnraisableHookArgs) -> bool:
+    return (
+        isinstance(unraisable.exc_value, ValueError)
+        and "I/O operation on closed file" in str(unraisable.exc_value)
+        and type(unraisable.object).__module__.split(".")[0] == "urllib3"
+    )
+
+
+def _silence_urllib3_finalizer_noise() -> None:
+    global _unraisable_hook_installed  # noqa: PLW0603
+    if _unraisable_hook_installed:
+        return
+    _unraisable_hook_installed = True
+    previous = sys.unraisablehook
+
+    def hook(unraisable: sys.UnraisableHookArgs) -> None:
+        if _is_urllib3_closed_file_noise(unraisable):
+            return
+        previous(unraisable)
+
+    sys.unraisablehook = hook
 
 
 def setup_scan_logging(run_dir: Path, *, debug: bool | None = None) -> Callable[[], None]:
@@ -119,6 +158,7 @@ def setup_scan_logging(run_dir: Path, *, debug: bool | None = None) -> Callable[
     stream_handler.setLevel(logging.DEBUG if debug else logging.ERROR)
     stream_handler.setFormatter(formatter)
     stream_handler.addFilter(context_filter)
+    stream_handler.addFilter(_StdoutQuietFilter())
     setattr(stream_handler, _HANDLER_TAG, True)
 
     tracked_loggers = [logging.getLogger(name) for name in _TRACKED_ROOTS]

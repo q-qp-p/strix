@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -12,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import AliasChoices, BaseModel
 
 from strix.config.settings import Settings
+from strix.utils.secret_files import write_secret_text
 
 
 if TYPE_CHECKING:
@@ -71,9 +71,7 @@ def persist_current() -> None:
                     env_block[alias.upper()] = value
                     break
 
-    target.write_text(json.dumps({"env": env_block}, indent=2), encoding="utf-8")
-    with contextlib.suppress(OSError):
-        target.chmod(0o600)
+    write_secret_text(target, json.dumps({"env": env_block}, indent=2))
 
 
 def _aliases_for(finfo: FieldInfo) -> list[str]:
@@ -106,6 +104,7 @@ def _read_json_overrides(path: Path) -> dict[str, dict[str, Any]]:
         return {}
 
     env_block_upper = {str(k).upper(): v for k, v in env_block.items()}
+    env_present = {k.upper() for k in os.environ}
 
     nested: dict[str, dict[str, Any]] = {}
     for sub_name, sub_finfo in Settings.model_fields.items():
@@ -114,12 +113,12 @@ def _read_json_overrides(path: Path) -> dict[str, dict[str, Any]]:
             continue
         sub_data: dict[str, Any] = {}
         for fname, finfo in sub_cls.model_fields.items():
-            for alias in _aliases_for(finfo):
-                key = alias.upper()
-                if key in os.environ:
-                    break  # env wins; skip JSON for this field
-                if key in env_block_upper:
-                    sub_data[fname] = env_block_upper[key]
+            aliases = [alias.upper() for alias in _aliases_for(finfo)]
+            if any(alias in env_present for alias in aliases):
+                continue  # env wins under some alias; skip the JSON file for this field
+            for alias in aliases:
+                if alias in env_block_upper:
+                    sub_data[fname] = env_block_upper[alias]
                     break
         if sub_data:
             nested[sub_name] = sub_data

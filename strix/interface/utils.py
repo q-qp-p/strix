@@ -1,5 +1,6 @@
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -10,17 +11,20 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, urlparse
 
 import docker
+import requests
 from docker.errors import DockerException, ImageNotFound
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
 from strix.config import load_settings
+from strix.utils.api_spec import detect_spec_format
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_severity_color(severity: str) -> str:
@@ -249,6 +253,20 @@ def _llm_usage(report_state: Any) -> dict[str, Any]:
     return usage if isinstance(usage, dict) else {}
 
 
+def is_subscription_run(report_state: Any) -> bool:
+    """Whether this run uses a model subscription (no metered cost).
+
+    Prefers the run record so it's correct for hydrated/resumed runs; falls back
+    to current settings.
+    """
+    record = getattr(report_state, "run_record", None)
+    if isinstance(record, dict) and record.get("auth_mode"):
+        return record.get("auth_mode") == "subscription"
+    from strix.config import codex
+
+    return codex.auth_mode(load_settings().llm.model) == "subscription"
+
+
 def _int_stat(usage: dict[str, Any], key: str) -> int:
     try:
         return max(0, int(usage.get(key) or 0))
@@ -273,17 +291,27 @@ def _detail_value(usage: dict[str, Any], detail_key: str, value_key: str) -> int
     return _int_stat(details, value_key)
 
 
+def has_model_response(report_state: Any) -> bool:
+    usage = _llm_usage(report_state)
+    return bool(usage) and _int_stat(usage, "requests") > 0
+
+
 def _build_llm_usage_stats(
     stats_text: Text,
     report_state: Any,
     *,
     live: bool = False,
 ) -> None:
+    subscription = is_subscription_run(report_state)
     usage = _llm_usage(report_state)
     if not usage or _int_stat(usage, "requests") <= 0:
         stats_text.append("\n")
         stats_text.append("Cost ", style="dim")
-        stats_text.append("$0.0000 ", style="#fbbf24")
+        if subscription:
+            stats_text.append("$0.00 ", style="#22c55e")
+            stats_text.append("(subscription) ", style="dim")
+        else:
+            stats_text.append("$0.0000 ", style="#fbbf24")
         stats_text.append("· ", style="dim white")
         stats_text.append("Tokens ", style="dim")
         stats_text.append("0", style="white")
@@ -308,7 +336,12 @@ def _build_llm_usage_stats(
     stats_text.append("Output Tokens ", style="dim")
     stats_text.append(format_token_count(output_tokens), style="white")
 
-    if live or cost > 0:
+    if subscription:
+        stats_text.append("  ·  ", style="dim white")
+        stats_text.append("Cost ", style="dim")
+        stats_text.append("$0.00", style="#22c55e")
+        stats_text.append(" (subscription)", style="dim")
+    elif live or cost > 0:
         stats_text.append("  ·  ", style="dim white")
         stats_text.append("Cost ", style="dim")
         stats_text.append(f"${cost:.4f}", style="#fbbf24")
@@ -333,6 +366,9 @@ def build_live_stats_text(report_state: Any) -> Text:
     model = load_settings().llm.model or "unknown"
     stats_text.append("Model ", style="dim")
     stats_text.append(str(model), style="white")
+    if is_subscription_run(report_state):
+        stats_text.append("  ·  ", style="dim white")
+        stats_text.append("ChatGPT subscription", style="#22c55e")
     stats_text.append("\n")
 
     vuln_count = len(report_state.vulnerability_reports)
@@ -375,6 +411,10 @@ def build_tui_stats_text(report_state: Any) -> Text:
 
     model = load_settings().llm.model or "unknown"
     stats_text.append(str(model), style="white")
+    subscription = is_subscription_run(report_state)
+    if subscription:
+        stats_text.append("\n")
+        stats_text.append("ChatGPT subscription", style="#22c55e")
 
     usage = _llm_usage(report_state)
     if usage and _int_stat(usage, "total_tokens") > 0:
@@ -384,7 +424,10 @@ def build_tui_stats_text(report_state: Any) -> Text:
             style="white",
         )
         cost = _float_stat(usage, "cost")
-        if cost > 0:
+        if subscription:
+            stats_text.append(" · ", style="white")
+            stats_text.append("$0.00", style="white")
+        elif cost > 0:
             stats_text.append(" · ", style="white")
             stats_text.append(f"${cost:.2f}", style="white")
 
@@ -441,6 +484,15 @@ def _derive_target_label_for_run_name(targets_info: list[dict[str, Any]] | None)
 
     if target_type == "ip_address":
         return str(details.get("target_ip", original) or original)
+
+    if target_type == "api_spec":
+        if details.get("source") == "postman_api":
+            return "postman-collection"
+        spec_path = details.get("target_spec", original)
+        try:
+            return str(Path(spec_path).stem or spec_path)
+        except Exception:
+            return str(spec_path)
 
     return str(original or "pentest")
 
@@ -1050,12 +1102,11 @@ def resolve_diff_scope_context(
 def _is_http_git_repo(url: str) -> bool:
     check_url = f"{url.rstrip('/')}/info/refs?service=git-upload-pack"
     try:
-        req = Request(check_url, headers={"User-Agent": "git/strix"})  # noqa: S310
-        with urlopen(req, timeout=10) as resp:  # noqa: S310  # nosec B310
+        with requests.get(check_url, headers={"User-Agent": "git/strix"}, timeout=10) as resp:
+            if resp.status_code >= 400:
+                return resp.status_code == 401
             return "x-git-upload-pack-advertisement" in resp.headers.get("Content-Type", "")
-    except HTTPError as e:
-        return e.code == 401
-    except (URLError, OSError, ValueError):
+    except (requests.RequestException, ValueError):
         return False
 
 
@@ -1072,6 +1123,24 @@ def infer_target_type(target: str) -> tuple[str, dict[str, str]]:  # noqa: PLR09
         return "repository", {"target_repo": target}
 
     parsed = urlparse(target)
+    if parsed.scheme == "postman":
+        collection_uid = f"{parsed.netloc}{parsed.path}".strip("/")
+        if not collection_uid:
+            raise ValueError(
+                f"Missing Postman collection id in '{target}' (expected postman://<collection-uid>)"
+            )
+        details = {
+            "target_spec": target,
+            "spec_format": "postman",
+            "source": "postman_api",
+            "collection_uid": collection_uid,
+        }
+        query = parse_qs(parsed.query)
+        env_uid = (query.get("env") or query.get("environment") or [""])[0].strip()
+        if env_uid:
+            details["environment_uid"] = env_uid
+        return "api_spec", details
+
     if parsed.scheme in ("http", "https"):
         if parsed.username or parsed.password:
             return "repository", {"target_repo": target}
@@ -1095,7 +1164,14 @@ def infer_target_type(target: str) -> tuple[str, dict[str, str]]:  # noqa: PLR09
     try:
         if path.exists():
             if path.is_dir():
+                check_mountable_dir(path)
                 return "local_code", {"target_path": str(path.resolve())}
+            spec_format = detect_spec_format(path)
+            if spec_format is not None:
+                return "api_spec", {
+                    "target_spec": str(path.resolve()),
+                    "spec_format": spec_format,
+                }
             raise ValueError(f"Path exists but is not a directory: {target}")
     except (OSError, RuntimeError) as e:
         raise ValueError(f"Invalid path: {target} - {e!s}") from e
@@ -1122,9 +1198,38 @@ def infer_target_type(target: str) -> tuple[str, dict[str, str]]:  # noqa: PLR09
         "- A valid URL (http:// or https://)\n"
         "- A Git repository URL (https://host/org/repo or git@host:org/repo.git)\n"
         "- A local directory path\n"
+        "- An API spec file (OpenAPI/Swagger .json/.yaml or a Postman collection)\n"
+        "- A Postman collection by id (postman://<collection-uid>[?env=<environment-uid>], "
+        "needs POSTMAN_API_KEY)\n"
         "- A domain name (e.g., example.com)\n"
         "- An IP address (e.g., 192.168.1.10)"
     )
+
+
+def read_target_list_file(path_str: str) -> list[str]:
+    """Read scan targets from a file, one target per non-empty, non-comment line."""
+    if not path_str or not path_str.strip():
+        raise ValueError("--target-list path must not be empty.")
+
+    path = Path(path_str).expanduser()
+    if not path.is_file():
+        raise ValueError(f"Target list file '{path_str}' is not an existing file.")
+
+    try:
+        targets = [
+            target
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if (target := line.strip()) and not target.startswith("#")
+        ]
+    except UnicodeDecodeError as e:
+        raise ValueError(f"Target list file '{path_str}' must be valid UTF-8 text: {e!s}") from e
+    except OSError as e:
+        raise ValueError(f"Failed to read target list file '{path_str}': {e!s}") from e
+
+    targets = [target for target in targets if target]
+    if not targets:
+        raise ValueError(f"Target list file '{path_str}' is empty.")
+    return targets
 
 
 def sanitize_name(name: str) -> str:
@@ -1185,8 +1290,8 @@ def is_whitebox_scan(targets_info: list[dict[str, Any]]) -> bool:
     return any(t.get("type") == "local_code" for t in targets_info or [])
 
 
-def collect_local_sources(targets_info: list[dict[str, Any]]) -> list[dict[str, str]]:
-    local_sources: list[dict[str, str]] = []
+def collect_local_sources(targets_info: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    local_sources: list[dict[str, Any]] = []
 
     for target_info in targets_info:
         details = target_info["details"]
@@ -1197,6 +1302,7 @@ def collect_local_sources(targets_info: list[dict[str, Any]]) -> list[dict[str, 
                 {
                     "source_path": details["target_path"],
                     "workspace_subdir": workspace_subdir,
+                    "protect_metadata": True,
                 }
             )
 
@@ -1205,10 +1311,127 @@ def collect_local_sources(targets_info: list[dict[str, Any]]) -> list[dict[str, 
                 {
                     "source_path": details["cloned_repo_path"],
                     "workspace_subdir": workspace_subdir,
+                    "protect_metadata": False,
                 }
             )
 
     return local_sources
+
+
+# Refused along with everything under them.
+_FORBIDDEN_MOUNT_TREES = frozenset(
+    {
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/etc",
+        "/lib",
+        "/lib64",
+        "/nix/store",
+        "/run/current-system/sw",
+        "/Applications",
+        "/Library",
+        "/System",
+        "/dev",
+        "/boot",
+        "/proc",
+        "/sys",
+    }
+)
+
+# Refused themselves, but they hold projects too, so their contents are fine.
+_FORBIDDEN_MOUNT_ROOTS = frozenset(
+    {
+        "/",
+        "/private",
+        "/var",
+        "/opt",
+        "/home",
+        "/root",
+        "/srv",
+        "/Users",
+        "/Volumes",
+    }
+)
+
+_FORBIDDEN_WINDOWS_TREE_NAMES = frozenset(
+    {"windows", "program files", "program files (x86)", "programdata"}
+)
+
+_FORBIDDEN_MOUNT_DIR_NAMES = frozenset(
+    {
+        ".ssh",
+        ".tsh",
+        ".brev",
+        ".gnupg",
+        ".aws",
+        ".azure",
+        ".kube",
+        ".docker",
+        ".config",
+        ".npm",
+        ".pki",
+        ".terraform.d",
+    }
+)
+
+
+def _is_within(path: Path, ancestor: Path) -> bool:
+    ancestor_parts = [part.casefold() for part in ancestor.parts]
+    path_parts = [part.casefold() for part in path.parts]
+    return path_parts[: len(ancestor_parts)] == ancestor_parts
+
+
+def check_mountable_dir(path: Path) -> None:
+    resolved = path.resolve()
+    if not resolved.is_dir():
+        raise ValueError(f"'{path}' is not an existing directory.")
+
+    # Both the literal and the resolved form: macOS reaches /etc through the
+    # /private/etc symlink, and only the resolved path is compared below.
+    exact = {str(Path(root)).casefold() for root in _FORBIDDEN_MOUNT_ROOTS}
+    exact |= {str(Path(root).resolve()).casefold() for root in _FORBIDDEN_MOUNT_ROOTS}
+    exact.add(str(Path.home().resolve()).casefold())
+    tree_roots = set(_FORBIDDEN_MOUNT_TREES)
+    if os.name == "nt":
+        drive = Path(resolved.anchor)
+        tree_roots |= {str(drive / name) for name in _FORBIDDEN_WINDOWS_TREE_NAMES}
+        exact.add(str(drive / "Users").casefold())
+    trees = [Path(root) for root in tree_roots] + [Path(root).resolve() for root in tree_roots]
+    if (
+        str(resolved).casefold() in exact
+        or resolved.parent == resolved
+        or any(_is_within(resolved, tree) for tree in trees)
+    ):
+        raise ValueError(
+            f"Refusing to mount '{resolved}' into the sandbox: it is a system "
+            "or home directory, not a codebase. Point the target at the "
+            "project directory you want tested."
+        )
+
+    credential = next(
+        (part for part in resolved.parts if part.casefold() in _FORBIDDEN_MOUNT_DIR_NAMES), None
+    )
+    if credential is not None:
+        raise ValueError(
+            f"Refusing to mount '{resolved}' into the sandbox: '{credential}' "
+            "holds credentials, not code."
+        )
+
+
+def dedupe_local_targets(targets_info: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for target in targets_info:
+        details = target.get("details") or {}
+        path = details.get("target_path")
+        if target.get("type") != "local_code" or not path:
+            result.append(target)
+            continue
+        if path not in seen_paths:
+            seen_paths.add(path)
+            result.append(target)
+    return result
 
 
 def _is_localhost_host(host: str) -> bool:
@@ -1252,6 +1475,62 @@ def rewrite_localhost_targets(targets_info: list[dict[str, Any]], host_gateway: 
                 details["target_ip"] = host_gateway
 
 
+#: API spec targets are copied into one workspace directory rather than mounted
+#: from wherever they happen to live on the host.
+API_SPEC_WORKSPACE_SUBDIR = "api-specs"
+
+
+def write_fetched_collection(collection: dict[str, Any], collection_uid: str) -> str:
+    """Write a collection fetched from the Postman API to a local file.
+
+    Returns the file path, so a ``postman://`` target continues as an ordinary
+    spec file from here on and the API key never leaves the host.
+    """
+    staging = Path(tempfile.gettempdir()) / "strix_api_specs" / "fetched"
+    staging.mkdir(parents=True, exist_ok=True)
+    path = staging / f"{sanitize_name(collection_uid)}.postman_collection.json"
+    path.write_text(json.dumps(collection, indent=2), encoding="utf-8")
+    return str(path)
+
+
+def stage_api_specs(targets_info: list[dict[str, Any]], run_name: str) -> list[dict[str, Any]]:
+    """Copy every ``api_spec`` target into one directory for the sandbox.
+
+    A spec is a single file the agent reads, not a tree it works in, so it is
+    copied to a per-run staging directory that is exposed at
+    ``/workspace/api-specs`` instead of mounting its host location. Each target's
+    ``workspace_path`` records where the agent will find it.
+    """
+    specs = [t for t in targets_info if t.get("type") == "api_spec"]
+    if not specs:
+        return []
+
+    staging = Path(tempfile.gettempdir()) / "strix_api_specs" / run_name
+    staging.mkdir(parents=True, exist_ok=True)
+
+    used: set[str] = set()
+    for target in specs:
+        details = target["details"]
+        source = Path(str(details["target_spec"]))
+        name = source.name
+        stem, suffix = source.stem, source.suffix
+        count = 1
+        while name in used:
+            count += 1
+            name = f"{stem}-{count}{suffix}"
+        used.add(name)
+        shutil.copy2(source, staging / name)
+        details["workspace_path"] = f"/workspace/{API_SPEC_WORKSPACE_SUBDIR}/{name}"
+
+    return [
+        {
+            "source_path": str(staging),
+            "workspace_subdir": API_SPEC_WORKSPACE_SUBDIR,
+            "protect_metadata": False,
+        }
+    ]
+
+
 def clone_repository(repo_url: str, run_name: str, dest_name: str | None = None) -> str:
     console = Console()
 
@@ -1289,43 +1568,13 @@ def clone_repository(repo_url: str, run_name: str, dest_name: str | None = None)
         return str(clone_path.absolute())
 
     except subprocess.CalledProcessError as e:
-        error_text = Text()
-        error_text.append("REPOSITORY CLONE FAILED", style="bold red")
-        error_text.append("\n\n", style="white")
-        error_text.append(f"Could not clone repository: {repo_url}\n", style="white")
-        error_text.append(
-            f"Error: {e.stderr if hasattr(e, 'stderr') and e.stderr else str(e)}", style="dim red"
-        )
-
-        panel = Panel(
-            error_text,
-            title="[bold white]STRIX",
-            title_align="left",
-            border_style="red",
-            padding=(1, 2),
-        )
-        console.print("\n")
-        console.print(panel)
-        console.print()
-        sys.exit(1)
-    except FileNotFoundError:
-        error_text = Text()
-        error_text.append("GIT NOT FOUND", style="bold red")
-        error_text.append("\n\n", style="white")
-        error_text.append("Git is not installed or not available in PATH.\n", style="white")
-        error_text.append("Please install Git to clone repositories.\n", style="white")
-
-        panel = Panel(
-            error_text,
-            title="[bold white]STRIX",
-            title_align="left",
-            border_style="red",
-            padding=(1, 2),
-        )
-        console.print("\n")
-        console.print(panel)
-        console.print()
-        sys.exit(1)
+        detail = e.stderr if hasattr(e, "stderr") and e.stderr else str(e)
+        raise ValueError(f"Could not clone repository {repo_url}: {detail}") from e
+    except FileNotFoundError as e:
+        raise ValueError(
+            "Git is not installed or not available in PATH. "
+            "Please install Git to clone repositories."
+        ) from e
 
 
 def check_docker_connection() -> Any:
