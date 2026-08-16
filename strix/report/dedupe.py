@@ -62,6 +62,7 @@ def _dedupe_model_settings(
         # must never receive the main endpoint's credentials. A dedicated model
         # gets its own DEDUPE_LLM_EXTRA_HEADERS instead.
         extra_headers=dedupe.extra_headers if dedupe.model else llm.extra_headers,
+        has_tools=False,
     )
     extra = _dedupe_extra_args(dedupe)
     if extra:
@@ -183,6 +184,24 @@ def _dependency_identity(report: dict[str, Any]) -> tuple[str, str, str] | None:
     return cve, ecosystem, package_name
 
 
+def _manifest_path(report: dict[str, Any]) -> str:
+    metadata = report.get("dependency_metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("manifest_path") or "").strip()
+
+
+def _distinct_manifest_paths(candidate: dict[str, Any], report: dict[str, Any]) -> bool:
+    """Same CVE/package observed in two different manifests is two findings.
+
+    Only applies when both sides carry a manifest_path; a missing path keeps
+    the legacy CVE/package/ecosystem identity.
+    """
+    candidate_path = _manifest_path(candidate)
+    report_path = _manifest_path(report)
+    return bool(candidate_path and report_path and candidate_path != report_path)
+
+
 def _report_cve(report: dict[str, Any]) -> str:
     return str(report.get("cve") or "").strip().upper()
 
@@ -227,6 +246,8 @@ def _check_dependency_duplicate(
         if report_identity is not None:
             report_cve, report_ecosystem, report_package_name = report_identity
             if (report_cve, report_package_name) != (cve, package_name):
+                continue
+            if _distinct_manifest_paths(candidate, report):
                 continue
             if report_ecosystem == ecosystem:
                 return {

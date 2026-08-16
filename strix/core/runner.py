@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
@@ -113,6 +114,7 @@ async def run_strix_scan(
     scan_id: str | None = None,
     image: str,
     local_sources: list[dict[str, Any]] | None = None,
+    extra_files: list[dict[str, Any]] | None = None,
     coordinator: AgentCoordinator | None = None,
     interactive: bool = False,
     max_turns: int = DEFAULT_MAX_TURNS,
@@ -128,6 +130,9 @@ async def run_strix_scan(
 
     ``root_instructions_override`` adds root scan instructions to the rendered
     root prompt without replacing the system-verified scope block.
+    ``extra_files`` entries (``{"workspace_path", "content"}``) are placed into
+    the sandbox workspace at session bring-up; see
+    :func:`strix.runtime.session_manager.create_or_reuse`.
     ``extra_system_prompt_context`` is merged into the root agent's scan
     context before prompt rendering. Child agents keep the standard scan prompt
     and context.
@@ -227,6 +232,7 @@ async def run_strix_scan(
         scan_id,
         image=image,
         local_sources=local_sources or [],
+        extra_files=extra_files,
         status_sink=status_sink,
     )
     report("Waiting for the first model response")
@@ -293,7 +299,7 @@ async def run_strix_scan(
         )
 
         root_agent = build_strix_agent(
-            name="Strix",
+            name="Root Agent",
             skills=skills,
             is_root=True,
             scan_mode=scan_mode,
@@ -307,7 +313,7 @@ async def run_strix_scan(
         if not is_resume:
             await coordinator.register(
                 root_id,
-                "Strix",
+                "Root Agent",
                 parent_id=None,
                 task=root_task,
                 skills=skills,
@@ -429,7 +435,6 @@ async def run_strix_scan(
     except BudgetExceededError as exc:
         logger.info("Scan %s stopped: %s", scan_id, exc)
         if root_id is not None:
-            await coordinator.cancel_descendants(root_id)
             with contextlib.suppress(Exception):
                 await coordinator.set_status(root_id, "stopped")
         return None
@@ -442,19 +447,28 @@ async def run_strix_scan(
             scan_id,
         )
         if root_id is not None:
-            await coordinator.cancel_descendants(root_id)
             with contextlib.suppress(Exception):
                 await coordinator.set_status(root_id, "stopped")
         return None
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("Scan %s interrupted by the user", scan_id)
+        if root_id is not None:
+            with contextlib.suppress(Exception):
+                await coordinator.set_status(root_id, "running")
+        raise
     except BaseException:
         logger.exception("Strix scan %s failed", scan_id)
         if root_id is not None:
-            await coordinator.cancel_descendants(root_id)
             with contextlib.suppress(Exception):
                 await coordinator.set_status(root_id, "failed")
         raise
     finally:
         configure_spill_writer(None)
+        # Settle descendants before closing sessions: on a clean finish a child
+        # can still be mid-turn, and closing its session underneath it crashes it.
+        if root_id is not None:
+            with contextlib.suppress(Exception):
+                await coordinator.cancel_descendants(root_id)
         for s in sessions_to_close:
             with contextlib.suppress(Exception):
                 s.close()

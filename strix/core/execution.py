@@ -830,7 +830,7 @@ async def _append_tool_required_message(
             "execution and never hands control to the user: it is shown to the user, and the "
             "run continues. Continue immediately and call exactly one tool. "
             "If you have something to tell the user and nothing to do until they reply, "
-            "call respond_to_user. "
+            "call respond_to_user — with no message if you have already said it. "
             "If you are blocked waiting for another agent, call wait_for_agents. "
             f"If the whole engagement is complete, call {finish_tool}. "
             "Otherwise use the appropriate execution or planning tool. "
@@ -838,7 +838,7 @@ async def _append_tool_required_message(
         )
     else:
         message = (
-            "Your previous response ended the autonomous Strix run without a lifecycle tool "
+            "Your previous response ended the autonomous run without a lifecycle tool "
             "call. That is invalid in non-interactive mode; plain text final answers are "
             "ignored. Continue immediately and call exactly one tool. "
             f"If your work is complete, call {finish_tool}. "
