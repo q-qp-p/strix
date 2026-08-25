@@ -13,9 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import docker
 import requests
-from docker.errors import DockerException, ImageNotFound
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -132,6 +130,27 @@ def format_vulnerability_report(report: dict[str, Any]) -> Text:  # noqa: PLR091
         if cvss_parts:
             text.append("CVSS Vector: ", style=field_style)
             text.append("/".join(cvss_parts), style="dim")
+
+    dependency_metadata = report.get("dependency_metadata") or {}
+    if dependency_metadata:
+        contextual_vector = dependency_metadata.get("contextual_cvss_vector")
+        if contextual_vector:
+            text.append("\n\n")
+            text.append("Contextual CVSS Vector: ", style=field_style)
+            text.append(contextual_vector, style="dim")
+
+        advisory_cvss = dependency_metadata.get("advisory_cvss")
+        if advisory_cvss is not None and advisory_cvss != report.get("cvss"):
+            text.append("\n\n")
+            text.append("Advisory CVSS: ", style=field_style)
+            text.append(f"{float(advisory_cvss):.1f}", style="dim")
+
+        contextual_reasoning = dependency_metadata.get("contextual_cvss_reasoning")
+        if contextual_reasoning:
+            text.append("\n\n")
+            text.append("Contextual CVSS Reasoning", style=field_style)
+            text.append("\n")
+            text.append(contextual_reasoning)
 
     description = report.get("description")
     if description:
@@ -1578,6 +1597,9 @@ def clone_repository(repo_url: str, run_name: str, dest_name: str | None = None)
 
 
 def check_docker_connection() -> Any:
+    import docker
+    from docker.errors import DockerException
+
     try:
         return docker.from_env()
     except DockerException:
@@ -1603,6 +1625,8 @@ def check_docker_connection() -> Any:
 
 
 def image_exists(client: Any, image_name: str) -> bool:
+    from docker.errors import ImageNotFound
+
     try:
         client.images.get(image_name)
     except ImageNotFound:
