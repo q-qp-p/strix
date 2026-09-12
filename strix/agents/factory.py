@@ -29,6 +29,7 @@ from strix.tools.agents_graph.tools import (
 from strix.tools.coverage.tools import list_coverage, record_coverage, update_coverage
 from strix.tools.finish.tool import finish_scan
 from strix.tools.load_skill.tool import load_skill
+from strix.tools.mcp import call_mcp, describe_mcp, list_mcps
 from strix.tools.notes.tools import (
     create_note,
     delete_note,
@@ -36,6 +37,7 @@ from strix.tools.notes.tools import (
     list_notes,
     update_note,
 )
+from strix.tools.nullish import is_nullish
 from strix.tools.output_store import bound_and_store, bound_text
 from strix.tools.proxy.tools import (
     list_requests,
@@ -50,6 +52,7 @@ from strix.tools.reporting.tool import (
     create_vulnerability_report,
     get_report,
     list_reports,
+    update_vulnerability_report,
 )
 from strix.tools.respond.tool import respond_to_user
 from strix.tools.thinking.tool import think
@@ -66,7 +69,7 @@ from strix.tools.todo.tools import (
     mark_todo_pending,
     update_todo,
 )
-from strix.tools.web_search.tool import web_search
+from strix.tools.web_search.tool import web_get_contents, web_search
 
 
 if TYPE_CHECKING:
@@ -164,6 +167,28 @@ def _schema_types(spec: dict[str, Any]) -> set[str]:
     return types
 
 
+def _allows_null(spec: dict[str, Any]) -> bool:
+    raw = spec.get("type")
+    if raw == "null" or (isinstance(raw, list) and "null" in raw):
+        return True
+    return any(
+        isinstance(variant, dict) and _allows_null(variant) for variant in spec.get("anyOf") or ()
+    )
+
+
+def _is_nullable(key: str, spec: dict[str, Any], schema: dict[str, Any]) -> bool:
+    """Whether ``key`` may be ``None``.
+
+    Strict schemas list every property as required, so nullability shows up as a
+    ``null`` type variant; without a declared one, fall back to the property
+    being absent from a declared ``required`` list.
+    """
+    if _allows_null(spec):
+        return True
+    required = schema.get("required")
+    return isinstance(required, list) and key not in required
+
+
 def _decode_structured(value: str, types: set[str]) -> Any:
     stripped = value.strip()
     if not stripped:
@@ -178,9 +203,14 @@ def _decode_structured(value: str, types: set[str]) -> Any:
     return decoded if isinstance(decoded, wanted) else value
 
 
-def _coerce_argument(value: Any, spec: dict[str, Any]) -> Any:
+def _coerce_argument(value: Any, spec: dict[str, Any], *, nullable: bool = False) -> Any:
+    if value is None:
+        return value
+    if nullable and is_nullish(value):
+        # The model's stand-in for "no value"; as a filter it matches nothing.
+        return None
     types = _schema_types(spec)
-    if not types or value is None:
+    if not types:
         return value
     if isinstance(value, list | dict) and "string" in types and not types & {"array", "object"}:
         return json.dumps(value, ensure_ascii=False)
@@ -189,7 +219,12 @@ def _coerce_argument(value: Any, spec: dict[str, Any]) -> Any:
     return value
 
 
-def _coerce_arguments(raw_input: str, schema: dict[str, Any]) -> str:
+# Only query tools get nullish coercion: there a literal "null" is a filter that
+# matches nothing, while a tool that writes may well be given it as real content.
+_QUERY_TOOL_PREFIXES = ("list_", "search_", "view_", "get_")
+
+
+def _coerce_arguments(raw_input: str, schema: dict[str, Any], *, nullish: bool = False) -> str:
     properties = schema.get("properties")
     if not isinstance(properties, dict) or not properties:
         return raw_input
@@ -205,7 +240,9 @@ def _coerce_arguments(raw_input: str, schema: dict[str, Any]) -> str:
         spec = properties.get(key)
         if not isinstance(spec, dict):
             continue
-        coerced = _coerce_argument(value, spec)
+        coerced = _coerce_argument(
+            value, spec, nullable=nullish and _is_nullable(key, spec, schema)
+        )
         if coerced is not value:
             payload[key] = coerced
             changed = True
@@ -220,9 +257,10 @@ def _with_coerced_arguments(tool: FunctionTool) -> FunctionTool:
         return tool
     invoke_tool = tool.on_invoke_tool
     schema = tool.params_json_schema
+    nullish = tool.name.startswith(_QUERY_TOOL_PREFIXES)
 
     async def invoke(ctx: Any, raw_input: str) -> Any:
-        return await invoke_tool(ctx, _coerce_arguments(raw_input, schema))
+        return await invoke_tool(ctx, _coerce_arguments(raw_input, schema, nullish=nullish))
 
     tool.on_invoke_tool = invoke
     tool._strix_coerced = True  # type: ignore[attr-defined]
@@ -541,8 +579,10 @@ _BASE_TOOLS: tuple[Tool, ...] = (
     save_threat_model,
     amend_threat_model,
     web_search,
+    web_get_contents,
     create_vulnerability_report,
     create_dependency_report,
+    update_vulnerability_report,
     list_reports,
     get_report,
     list_requests,
@@ -551,6 +591,9 @@ _BASE_TOOLS: tuple[Tool, ...] = (
     list_sitemap,
     view_sitemap_entry,
     scope_rules,
+    list_mcps,
+    describe_mcp,
+    call_mcp,
     view_agent_graph,
     send_message_to_agent,
     wait_for_agents,
