@@ -33,6 +33,7 @@ from strix.core.sessions import (
     seed_initial_input,
     strip_all_images_from_session,
 )
+from strix.llm import request_log
 from strix.llm.compaction import is_context_overflow, maybe_compact
 
 
@@ -197,6 +198,44 @@ async def run_agent_loop(
     start_parked: bool = False,
     event_sink: StreamEventSink | None = None,
     hooks: RunHooks[dict[str, Any]] | None = None,
+) -> RunResultBase | None:
+    agent_name = getattr(agent, "name", None)
+    token = request_log.bind_call_context(
+        agent_id, agent_name if isinstance(agent_name, str) else None
+    )
+    try:
+        return await _run_agent_loop(
+            agent=agent,
+            initial_input=initial_input,
+            run_config=run_config,
+            context=context,
+            max_turns=max_turns,
+            coordinator=coordinator,
+            agent_id=agent_id,
+            interactive=interactive,
+            session=session,
+            start_parked=start_parked,
+            event_sink=event_sink,
+            hooks=hooks,
+        )
+    finally:
+        request_log.reset_call_context(token)
+
+
+async def _run_agent_loop(
+    *,
+    agent: Any,
+    initial_input: Any,
+    run_config: RunConfig,
+    context: dict[str, Any],
+    max_turns: int,
+    coordinator: AgentCoordinator,
+    agent_id: str,
+    interactive: bool,
+    session: Session | None,
+    start_parked: bool,
+    event_sink: StreamEventSink | None,
+    hooks: RunHooks[dict[str, Any]] | None,
 ) -> RunResultBase | None:
     await coordinator.attach_runtime(
         agent_id,
@@ -483,33 +522,51 @@ async def _run_until_lifecycle(
             await coordinator.set_status(agent_id, "stopped")
             raise SubagentBudgetReservedError("scan reached the sub-agent budget reserve")
 
-        if interactive:
-            result = await _run_cycle_parked(
-                agent,
-                coordinator,
-                agent_id,
-                input_data=input_data,
-                run_config=run_config,
-                context=context,
-                max_turns=max_turns,
-                session=session,
-                event_sink=event_sink,
-                hooks=hooks,
-            )
-        else:
-            result = await _run_cycle(
-                agent,
-                coordinator,
-                agent_id,
-                input_data=input_data,
-                run_config=run_config,
-                context=context,
-                max_turns=max_turns,
-                session=session,
-                interactive=False,
-                event_sink=event_sink,
-                hooks=hooks,
-            )
+        try:
+            if interactive:
+                result = await _run_cycle_parked(
+                    agent,
+                    coordinator,
+                    agent_id,
+                    input_data=input_data,
+                    run_config=run_config,
+                    context=context,
+                    max_turns=max_turns,
+                    session=session,
+                    event_sink=event_sink,
+                    hooks=hooks,
+                )
+            else:
+                result = await _run_cycle(
+                    agent,
+                    coordinator,
+                    agent_id,
+                    input_data=input_data,
+                    run_config=run_config,
+                    context=context,
+                    max_turns=max_turns,
+                    session=session,
+                    interactive=False,
+                    event_sink=event_sink,
+                    hooks=hooks,
+                )
+        except BudgetPausedError as exc:
+            if coordinator.budget_policy != "pause":
+                raise
+            # The agent parked right before an LLM call; everything up to that
+            # point is already in its session. Once resumed, the same call goes
+            # out with nothing added to the conversation.
+            await coordinator.wait_for_budget_resume(agent_id, parked_epoch=exc.resume_epoch)
+            if (
+                not coordinator.budget_stopped
+                and await _agent_status(coordinator, agent_id) != "running"
+            ):
+                # Stopped while parked (operator stop or a parent's stop_agent).
+                await coordinator.reset_recovery(agent_id)
+                return result
+            if session is not None:
+                input_data = []
+            continue
 
         status = await _agent_status(coordinator, agent_id)
         if status != "running":
@@ -636,7 +693,7 @@ async def _run_cycle_parked(
         raise
     except Exception as exc:
         logger.exception("error escaped the run cycle for %s; parking as failed", agent_id)
-        await coordinator.set_status(agent_id, "failed", error=str(exc) or type(exc).__name__)
+        await coordinator.set_status(agent_id, "failed", error=request_log.failure_text(exc))
         await notify_parent_on_terminal(coordinator, agent_id, "failed")
         return None
 
@@ -658,6 +715,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
     image_strips = 0
     compactions = 0
     model_retries = 0
+    request_log.set_retry_attempt(0)
     while True:
         stream: Any = None
         pre_run_items: list[Any] = []
@@ -719,7 +777,10 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 await coordinator.detach_stream(agent_id, stream)
         except BudgetPausedError as exc:
             logger.info("agent %s paused at the scan budget limit: %s", agent_id, exc)
-            await coordinator.pause_for_budget(agent_id)
+            if coordinator.budget_policy == "pause":
+                await coordinator.park_for_budget(agent_id)
+            else:
+                await coordinator.pause_for_budget(agent_id)
             raise
         except SubagentBudgetReservedError as exc:
             logger.info("sub-agent %s stopped at the budget reserve: %s", agent_id, exc)
@@ -785,6 +846,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     exc,
                 )
                 await asyncio.sleep(delay)
+                request_log.set_retry_attempt(model_retries)
                 if session is not None:
                     input_data = []
                 continue
@@ -792,7 +854,9 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 await _salvage_stream_to_session(session, pre_run_items, stream, agent_id)
             if isinstance(exc, ProviderRefusalError):
                 logger.warning("agent %s refused by the model provider: %s", agent_id, exc)
-                await coordinator.set_status(agent_id, "failed", error=str(exc))
+                await coordinator.set_status(
+                    agent_id, "failed", error=request_log.failure_text(exc)
+                )
                 await notify_parent_on_terminal(coordinator, agent_id, "failed")
                 return None
             if isinstance(exc, MaxTurnsExceeded):
@@ -806,7 +870,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
             # non-interactive agent's task: a child that dies still owes its parent a
             # report, and the parent would otherwise wait out its timeout on a message
             # the dead child can no longer send.
-            await coordinator.set_status(agent_id, status, error=str(exc) or type(exc).__name__)
+            await coordinator.set_status(agent_id, status, error=request_log.failure_text(exc))
             await notify_parent_on_terminal(coordinator, agent_id, status)
             if not interactive:
                 raise
