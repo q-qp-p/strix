@@ -38,6 +38,7 @@ def _run(
     status: str = "completed",
     findings: int = 0,
     resumable: bool = True,
+    title: str = "",
 ) -> RunSummary:
     started = (NOW - timedelta(minutes=minutes_ago)).isoformat()
     return RunSummary(
@@ -48,6 +49,7 @@ def _run(
         status=status,
         findings=findings,
         resumable=resumable,
+        title=title,
     )
 
 
@@ -62,6 +64,7 @@ RUNS = [
         minutes_ago=60 * 26,
         status="stopped",
         findings=7,
+        title="SQL injection",
     ),
     _run(
         "strix_41c0",
@@ -127,7 +130,8 @@ def test_render_lists_every_run_with_its_metadata() -> None:
     for run in RUNS:
         assert run.run_name in text
     assert "12 min ago" in text
-    assert "https://juice-shop.herokuapp.com" in text
+    assert "https://juice-shop" in text
+    assert "SQL injection" in text
     assert "interrupted" in text
     assert "failed · no state" in text
     assert text.splitlines()[3].startswith(" \u276f ")
@@ -182,11 +186,6 @@ def test_no_match_renders_a_hint_and_enter_does_nothing() -> None:
     assert picker.handle(KEY_ENTER) == (False, None)
 
 
-def test_ctrl_c_raises_keyboard_interrupt() -> None:
-    with pytest.raises(KeyboardInterrupt):
-        _picker().handle(KEY_INTERRUPT)
-
-
 def test_long_lists_scroll_to_keep_the_cursor_visible() -> None:
     runs = [
         _run(f"run_{index:02d}", f"https://host{index}.example", minutes_ago=index)
@@ -218,6 +217,37 @@ def test_run_redraws_in_place_and_restores_the_cursor() -> None:
     assert "example-com_223e" in output
 
 
+def test_ctrl_c_cancels_like_escape() -> None:
+    console, _ = _console()
+    picker = ResumePicker(RUNS, console=console, runs_dir="strix_runs", now=NOW)
+    assert picker.handle(KEY_INTERRUPT) == (True, None)
+
+
+def test_sigint_while_waiting_for_a_key_cancels_and_restores_the_cursor() -> None:
+    console, buffer = _console()
+    picker = ResumePicker(RUNS, console=console, runs_dir="strix_runs", now=NOW)
+
+    def interrupted() -> str:
+        raise KeyboardInterrupt
+
+    assert picker.run(interrupted) is None
+    assert buffer.getvalue().endswith("\x1b[?25h")
+
+
+def test_sigint_while_drawing_cancels_and_restores_the_cursor() -> None:
+    console, buffer = _console()
+    picker = ResumePicker(RUNS, console=console, runs_dir="strix_runs", now=NOW)
+    draw = picker.draw
+
+    def interrupted_draw() -> None:
+        draw()
+        raise KeyboardInterrupt
+
+    picker.draw = interrupted_draw  # type: ignore[method-assign]
+    assert picker.run(lambda: KEY_DOWN) is None
+    assert buffer.getvalue().endswith("\x1b[?25h")
+
+
 def test_pick_run_needs_a_terminal() -> None:
     console, _ = _console()
     with pytest.raises(PickerUnavailableError):
@@ -233,7 +263,11 @@ def test_narrow_terminals_never_wrap_a_row() -> None:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX key reader")
 def test_posix_key_reader_handles_multibyte_and_arrows() -> None:
+    tty = pytest.importorskip("tty")
     master, slave = os.openpty()
+    # Without this the pty echoes the writes into an output queue nobody reads,
+    # and read_raw_key's TCSADRAIN restore blocks forever on macOS.
+    tty.setcbreak(slave)
     try:
         with os.fdopen(slave, "r+b", buffering=0) as stream:
             os.write(master, "\u00e9".encode())

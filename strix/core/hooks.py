@@ -65,9 +65,12 @@ class BudgetPausedError(RuntimeError):
     decided to park; the agent waits for a resume newer than that.
     """
 
-    def __init__(self, message: str, *, resume_epoch: int = 0) -> None:
+    def __init__(
+        self, message: str, *, resume_epoch: int = 0, operator_pause: bool = False
+    ) -> None:
         super().__init__(message)
         self.resume_epoch = resume_epoch
+        self.operator_pause = operator_pause
 
 
 def _validate_budget(max_budget_usd: float | None) -> None:
@@ -104,16 +107,16 @@ _ROOT_DIRECTIVES: tuple[str, ...] = (
     (
         "As the root agent, begin planning your wind-down of the whole scan: avoid "
         "starting large new lines of investigation, and keep your required objectives on "
-        "track so you can call finish_scan comfortably before the limit."
+        "track so you can call {finish_tool} comfortably before the limit."
     ),
     (
         "As the root agent, prioritize wrapping up the whole scan now: stop opening new "
         "lines of investigation, close out only what is essential, and move toward calling "
-        "finish_scan to compile and deliver the final report."
+        "{finish_tool} to compile and deliver the final report."
     ),
     (
         "As the root agent, STOP all other work on the whole scan and finish immediately: "
-        "secure your findings and call finish_scan now — anything left unfinished when the "
+        "secure your findings and call {finish_tool} now — anything left unfinished when the "
         "limit is hit is discarded."
     ),
 )
@@ -138,8 +141,11 @@ _SUBAGENT_DIRECTIVES: tuple[str, ...] = (
 
 def _wrapup_directive(context: RunContextWrapper[dict[str, Any]], stage: int) -> str:
     is_root = context.context.get("parent_id") is None
-    directives = _ROOT_DIRECTIVES if is_root else _SUBAGENT_DIRECTIVES
-    return directives[stage]
+    if not is_root:
+        return _SUBAGENT_DIRECTIVES[stage]
+    coordinator = coordinator_from_context(context.context)
+    finish_tool = coordinator.root_finish_tool if coordinator is not None else "finish_scan"
+    return _ROOT_DIRECTIVES[stage].format(finish_tool=finish_tool)
 
 
 def _urgency(stage: int) -> str:
@@ -195,6 +201,7 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
         system_prompt: str | None,  # noqa: ARG002
         input_items: list[TResponseInputItem],
     ) -> None:
+        self._pause_if_operator_paused(context)
         if self._budget_policy == "pause":
             self._pause_if_limited(context)
         context.context[LLM_TURN_KEY] = int(context.context.get(LLM_TURN_KEY, 0)) + 1
@@ -203,6 +210,15 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
             self._maybe_warn_budget(context, input_items)
         except Exception:
             logger.exception("budget/turn warning injection failed")
+
+    def _pause_if_operator_paused(self, context: RunContextWrapper[dict[str, Any]]) -> None:
+        coordinator = coordinator_from_context(context.context)
+        if coordinator is not None and coordinator.operator_paused:
+            raise BudgetPausedError(
+                "scan paused; waiting for the operator to resume",
+                resume_epoch=coordinator.resume_epoch,
+                operator_pause=True,
+            )
 
     def _pause_if_limited(self, context: RunContextWrapper[dict[str, Any]]) -> None:
         """Park the agent before a paid call when the scan is at its limit or paused.
